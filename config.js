@@ -1,0 +1,4 @@
+window.FLOW_CONFIG = {
+  SUPABASE_URL: 'https://pvgjblahpehvpibxdepi.supabase.co',
+  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2Z2pibGFocGVodnBpYnhkZXBpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQyNDY5MTIsImV4cCI6MjEwOTgyMjkxMn0.cLjhZO0lHaw9iDF_7wAxNFjFTG6vwdAKcJSjl7ZfbO0'
+};
