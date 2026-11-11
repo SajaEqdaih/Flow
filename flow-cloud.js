@@ -9,6 +9,8 @@
   var CFG = window.FLOW_CONFIG || {};
   var META_KEY = 'flow-sync-v1';
   var LOCK_KEY = 'flow-lock-cred';
+  var PIN_KEY = 'flow-pin';
+  var PIN_FAIL_KEY = 'flow-pin-fail';
   var AUTH_FLAG = 'flow-authed';
   var USER_KEY = 'flow-user';
   var LOCK_AFTER_MS = 30000;
@@ -260,6 +262,7 @@
       localStorage.removeItem(App().STORAGE_KEY);
       localStorage.removeItem(META_KEY);
       localStorage.removeItem(LOCK_KEY);
+      localStorage.removeItem(PIN_KEY);
       Object.keys(localStorage).forEach(function (k) { if (k.indexOf('sb-') === 0) localStorage.removeItem(k); });
     } catch (e) {}
     meta = { rev: null, dirty: false, force: false };
@@ -289,7 +292,33 @@
       return Uint8Array.from(atob(str), function (c) { return c.charCodeAt(0); });
     }
   };
-  function lockEnabled() { return !!localStorage.getItem(LOCK_KEY); }
+  function bioEnabled() { return !!localStorage.getItem(LOCK_KEY); }
+  function pinEnabled() { return !!localStorage.getItem(PIN_KEY); }
+  function lockEnabled() { return bioEnabled() || pinEnabled(); }
+
+  /* ---------- رمز PIN داخلي (بديل مضمون للبصمة) ----------
+     يُخزَّن مشتقًا بـ PBKDF2 (لا يُحفظ الرمز نفسه). بعد 5 محاولات خاطئة: انتظار دقيقة. */
+  async function pinHash(pin, saltB64, iter) {
+    var key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
+    var bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: b64u.dec(saltB64), iterations: iter }, key, 256);
+    return b64u.enc(bits);
+  }
+  async function setPin(pin) {
+    var salt = b64u.enc(crypto.getRandomValues(new Uint8Array(16))), iter = 150000;
+    localStorage.setItem(PIN_KEY, JSON.stringify({ salt: salt, iter: iter, hash: await pinHash(pin, salt, iter) }));
+    localStorage.removeItem(PIN_FAIL_KEY);
+  }
+  async function checkPin(pin) {
+    var f = {}; try { f = JSON.parse(localStorage.getItem(PIN_FAIL_KEY) || '{}'); } catch (e) {}
+    if (f.until && Date.now() < f.until) return { ok: false, wait: Math.ceil((f.until - Date.now()) / 1000) };
+    var rec = JSON.parse(localStorage.getItem(PIN_KEY));
+    var ok = (await pinHash(pin, rec.salt, rec.iter)) === rec.hash;
+    if (ok) { localStorage.removeItem(PIN_FAIL_KEY); return { ok: true }; }
+    f.n = (f.n || 0) + 1;
+    if (f.n >= 5) { f.n = 0; f.until = Date.now() + 60000; }
+    localStorage.setItem(PIN_FAIL_KEY, JSON.stringify(f));
+    return { ok: false, wait: f.until ? 60 : 0 };
+  }
   async function bioSupported() {
     try { return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); }
     catch (e) { return false; }
@@ -307,7 +336,12 @@
     });
   }
   async function enableLock() {
-    if (!(await bioSupported())) { App().notify('هذا الجهاز أو المتصفح لا يدعم القفل بالبصمة'); return false; }
+    if (!window.isSecureContext || !window.PublicKeyCredential) {
+      App().notify('المتصفح لا يدعم القفل. استخدم Chrome أو Safari عبر رابط https'); return false;
+    }
+    if (!(await bioSupported())) {
+      App().notify('فعّل قفل الشاشة في الهاتف (بصمة أو رمز) من إعدادات الهاتف ثم أعد المحاولة'); return false;
+    }
     try {
       var cred = await navigator.credentials.create({
         publicKey: {
@@ -323,8 +357,11 @@
       localStorage.setItem(LOCK_KEY, b64u.enc(cred.rawId));
       return true;
     } catch (e) {
-      if (e && e.name !== 'NotAllowedError') console.error(e);
-      App().notify('لم يتم تفعيل القفل');
+      var n = e && e.name;
+      if (n === 'NotAllowedError') App().notify('تم إلغاء التحقق أو انتهت المهلة');
+      else if (n === 'SecurityError') App().notify('لا يمكن تفعيل القفل على هذا العنوان');
+      else if (n === 'InvalidStateError') App().notify('القفل مفعّل مسبقًا على هذا الجهاز');
+      else { console.error(e); App().notify('تعذر تفعيل القفل على هذا الجهاز'); }
       return false;
     }
   }
@@ -332,28 +369,41 @@
   function showLock() {
     return new Promise(function (resolve) {
       locked = true;
+      var bio = bioEnabled(), pin = pinEnabled();
       showGate(
         '<div class="panel" style="text-align:center">' +
         '<div class="lock-icon" aria-hidden="true">🔒</div>' +
         '<h1 class="page-title">FLOW مقفل</h1>' +
-        '<p class="page-sub">افتح بالبصمة أو الوجه للمتابعة.</p>' +
+        '<p class="page-sub">' + (pin && bio ? 'افتح بالبصمة أو أدخل رمز PIN.' : pin ? 'أدخل رمز PIN للمتابعة.' : 'افتح بالبصمة أو الوجه للمتابعة.') + '</p>' +
+        (pin ? '<input class="field" id="lockPin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" dir="ltr" autocomplete="off" placeholder="رمز PIN" style="text-align:center;letter-spacing:6px"/>' : '') +
         '<p class="warn" id="lockMsg" hidden></p>' +
-        '<button class="btn primary full" id="lockUnlock">فتح</button>' +
+        (pin ? '<button class="btn primary full" id="lockPinBtn" style="margin-top:10px">فتح</button>' : '') +
+        (bio ? '<button class="btn ' + (pin ? 'secondary' : 'primary') + ' full" id="lockUnlock" style="margin-top:10px">فتح بالبصمة</button>' : '') +
         '<button class="btn ghost full" id="lockLogout" style="margin-top:10px">تسجيل الخروج</button>' +
         '</div>'
       );
-      var attempt = async function (auto) {
-        try {
-          await verifyBio();
-          locked = false; hideGate(); resolve();
-        } catch (e) {
-          var m = $('lockMsg');
-          if (m && !auto) { m.textContent = 'لم يتم التحقق. حاول مرة أخرى.'; m.hidden = false; }
-        }
+      var msg = function (t) { var m = $('lockMsg'); if (m) { m.textContent = t; m.hidden = false; } };
+      var done = function () { locked = false; hideGate(); resolve(); };
+      var tryBio = async function (auto) {
+        try { await verifyBio(); done(); }
+        catch (e) { if (!auto) msg('لم يتم التحقق بالبصمة. حاول مرة أخرى أو استخدم الرمز.'); }
       };
-      $('lockUnlock').onclick = function () { attempt(false); };
+      var tryPin = async function () {
+        var v = ($('lockPin').value || '').trim();
+        if (v.length < 4) { msg('أدخل 4 أرقام على الأقل.'); return; }
+        var r = await checkPin(v);
+        if (r.ok) { done(); return; }
+        $('lockPin').value = '';
+        msg(r.wait ? 'محاولات كثيرة. انتظر ' + r.wait + ' ثانية ثم حاول مرة أخرى.' : 'الرمز غير صحيح.');
+      };
+      if (bio) $('lockUnlock').onclick = function () { tryBio(false); };
+      if (pin) {
+        $('lockPinBtn').onclick = tryPin;
+        $('lockPin').onkeydown = function (e) { if (e.key === 'Enter') tryPin(); };
+      }
       $('lockLogout').onclick = function () { logout(); };
-      setTimeout(function () { attempt(true); }, 350);
+      if (bio) setTimeout(function () { tryBio(true); }, 350);
+      else if (pin) setTimeout(function () { var i = $('lockPin'); if (i) i.focus(); }, 200);
     });
   }
 
@@ -367,7 +417,7 @@
     loggingOut = true;
     try { await sb.auth.signOut(); } catch (e) {}
     try {
-      [App().STORAGE_KEY, META_KEY, LOCK_KEY, AUTH_FLAG, USER_KEY].forEach(function (k) { localStorage.removeItem(k); });
+      [App().STORAGE_KEY, META_KEY, LOCK_KEY, PIN_KEY, PIN_FAIL_KEY, AUTH_FLAG, USER_KEY].forEach(function (k) { localStorage.removeItem(k); });
       Object.keys(localStorage).forEach(function (k) { if (k.indexOf('sb-') === 0) localStorage.removeItem(k); });
     } catch (e) {}
     location.reload();
@@ -395,13 +445,55 @@
       '<div class="notice" id="cloudStatus"></div>' +
       '<button class="btn secondary full" id="cloudSync" style="margin-top:12px">مزامنة الآن</button>' +
       '<button class="btn secondary full" id="cloudLock" style="margin-top:10px"></button>' +
-      '<p class="helper" style="margin-top:6px">القفل بالبصمة يخص هذا الجهاز فقط.</p>' +
-      '<button class="btn secondary full" id="cloudExport" style="margin-top:10px">تصدير نسخة احتياطية</button>';
+      '<button class="btn secondary full" id="cloudPin" style="margin-top:10px"></button>' +
+      '<p class="helper" style="margin-top:6px">القفل (البصمة / رمز PIN) يخص هذا الجهاز فقط. يُقفل التطبيق عند فتحه وبعد 30 ثانية في الخلفية.</p>' +
+      '<button class="btn secondary full" id="cloudExport" style="margin-top:10px">تصدير نسخة احتياطية</button>' +
+      '<button class="btn secondary full" id="cloudPass" style="margin-top:10px">تغيير كلمة المرور</button>' +
+      '<button class="btn secondary full" id="cloudInstall" style="margin-top:10px" hidden>تثبيت التطبيق على هذا الجهاز</button>';
   }
   function afterSettings() {
     setStatus(status);
     var b = $('cloudLock');
-    if (b) b.textContent = lockEnabled() ? 'إيقاف القفل بالبصمة' : 'تفعيل القفل بالبصمة';
+    if (b) b.textContent = bioEnabled() ? 'إيقاف القفل بالبصمة' : 'تفعيل القفل بالبصمة';
+    var pb = $('cloudPin');
+    if (pb) pb.textContent = pinEnabled() ? 'إيقاف رمز PIN' : 'تفعيل رمز PIN';
+    var ib = $('cloudInstall');
+    if (ib) ib.hidden = !(deferredInstall && !isStandalone());
+  }
+  var deferredInstall = null;
+  function isStandalone() {
+    return (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  }
+  window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredInstall = e; });
+  window.addEventListener('appinstalled', function () { deferredInstall = null; });
+
+  function pinDialog() {
+    var fld = function (id, label) {
+      return '<label class="field-label" for="' + id + '">' + label + '</label><input class="field" id="' + id + '" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" dir="ltr" autocomplete="off"/>';
+    };
+    if (pinEnabled()) {
+      App().showDialog('<div class="dialog-head"><h2 class="dialog-title">إيقاف رمز PIN</h2><button class="close" data-close="true">×</button></div>' +
+        fld('pinCur', 'أدخل الرمز الحالي') +
+        '<div class="dialog-actions"><button class="btn secondary" data-close="true">إلغاء</button><button class="btn danger" id="pinOffBtn">إيقاف</button></div>');
+    } else {
+      App().showDialog('<div class="dialog-head"><h2 class="dialog-title">تفعيل رمز PIN</h2><button class="close" data-close="true">×</button></div>' +
+        '<p class="page-sub">اختر رمزًا من 4 إلى 8 أرقام. يُستخدم لفتح التطبيق على هذا الجهاز.</p>' +
+        fld('pinNew', 'الرمز') + fld('pinNew2', 'أعد كتابة الرمز') +
+        '<div class="dialog-actions"><button class="btn secondary" data-close="true">إلغاء</button><button class="btn primary" id="pinSave">حفظ</button></div>');
+    }
+    afterSettings();
+  }
+
+  async function changePassword() {
+    if (!navigator.onLine) { App().notify('تغيير كلمة المرور يحتاج اتصالًا بالإنترنت'); return; }
+    var p1 = prompt('كلمة المرور الجديدة (8 أحرف على الأقل):');
+    if (p1 === null) return;
+    if (p1.length < 8) { App().notify('كلمة المرور قصيرة، استخدم 8 أحرف على الأقل'); return; }
+    var p2 = prompt('أعد كتابة كلمة المرور الجديدة:');
+    if (p2 === null) return;
+    if (p1 !== p2) { App().notify('كلمتا المرور غير متطابقتين'); return; }
+    var r = await sb.auth.updateUser({ password: p1 });
+    App().notify(r.error ? 'تعذر التغيير: ' + r.error.message : 'تم تغيير كلمة المرور');
   }
 
   document.addEventListener('click', async function (e) {
@@ -412,7 +504,7 @@
       await sync();
       App().notify(status === 'synced' ? 'تمت المزامنة' : 'تعذرت المزامنة');
     } else if (b.id === 'cloudLock') {
-      if (lockEnabled()) {
+      if (bioEnabled()) {
         try { await verifyBio(); } catch (er) { App().notify('لم يتم التحقق'); return; }
         localStorage.removeItem(LOCK_KEY); App().notify('تم إيقاف القفل');
       } else if (await enableLock()) { App().notify('تم تفعيل القفل بالبصمة'); }
@@ -421,6 +513,24 @@
       exportBackup();
     } else if (b.id === 'cloudLogout') {
       logout();
+    } else if (b.id === 'cloudPin') {
+      pinDialog();
+    } else if (b.id === 'pinSave') {
+      var p1 = ($('pinNew') || {}).value || '', p2 = ($('pinNew2') || {}).value || '';
+      if (!/^[0-9]{4,8}$/.test(p1)) { App().notify('الرمز يجب أن يكون من 4 إلى 8 أرقام'); return; }
+      if (p1 !== p2) { App().notify('الرمزان غير متطابقين'); return; }
+      await setPin(p1); App().closeDialog(); App().notify('تم تفعيل رمز PIN');
+    } else if (b.id === 'pinOffBtn') {
+      var cur = ($('pinCur') || {}).value || '';
+      var r = await checkPin(cur.trim());
+      if (!r.ok) { App().notify(r.wait ? 'محاولات كثيرة، انتظر قليلًا' : 'الرمز الحالي غير صحيح'); return; }
+      localStorage.removeItem(PIN_KEY); App().closeDialog(); App().notify('تم إيقاف رمز PIN');
+    } else if (b.id === 'cloudPass') {
+      changePassword();
+    } else if (b.id === 'cloudInstall' && deferredInstall) {
+      deferredInstall.prompt();
+      try { await deferredInstall.userChoice; } catch (er) {}
+      deferredInstall = null; afterSettings();
     }
   });
 
@@ -453,7 +563,7 @@
       var d = document.createElement('span'); d.className = 'sync-dot'; d.setAttribute('aria-hidden', 'true'); dotHost.appendChild(d);
     }
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-      navigator.serviceWorker.register('sw.js').catch(function (e) { console.warn('SW:', e); });
+      navigator.serviceWorker.register('service-worker.js', { scope: './' }).catch(function (e) { console.warn('SW:', e); });
     }
     if (!window.supabase || !CFG.SUPABASE_URL || /YOUR-PROJECT/.test(CFG.SUPABASE_URL) || !CFG.SUPABASE_ANON_KEY || /YOUR-ANON/.test(CFG.SUPABASE_ANON_KEY)) {
       gateMessage('لم يتم إعداد Supabase بعد. افتح الملف config.js وضع رابط المشروع والمفتاح العام (anon).', true);
