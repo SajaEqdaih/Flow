@@ -2,7 +2,7 @@
    - الشبكة أولًا (لتصلك التحديثات فورًا) ثم الكاش عند انقطاع الإنترنت.
    - تثبيت مرن: لو ملف ناقص في المستودع لا يفشل التثبيت (وإلا لا يصير التطبيق قابلًا للتثبيت).
    - لا يتدخل أبدًا في طلبات Supabase (نطاق مختلف). */
-const CACHE = 'flow-shell-v4';
+const CACHE = 'flow-shell-v5';
 const SHELL = ['./', 'index.html', 'config.js', 'supabase.js', 'flow-cloud.js', 'manifest.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png',
   'icons/apple-touch-icon.png', 'icons/favicon-32.png'];
